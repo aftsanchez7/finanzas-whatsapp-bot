@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: finanzas-whatsapp-bot
+    env: python
+    plan: free
+    buildCommand: ""
+    startCommand: gunicorn bot:app --bind 0.0.0.0:$PORT
