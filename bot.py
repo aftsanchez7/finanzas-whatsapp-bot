@@ -4,11 +4,11 @@ import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from datetime import datetime, timedelta
 from pytz import timezone
+import re
+import random
 
 app = Flask(__name__)
-
-# Configuración zona horaria
-ZONE = timezone('America/Santiago')
+ZONE = timezone("America/Santiago")
 
 # Google Sheets
 scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
@@ -16,20 +16,59 @@ creds = ServiceAccountCredentials.from_json_keyfile_name("credenciales.json", sc
 client = gspread.authorize(creds)
 sheet = client.open("Finanzas WhatsApp Bot").worksheet("Datos")
 
-def parse_fecha(fecha_str):
-    fecha_str = fecha_str.strip().lower()
-    hoy = datetime.now(ZONE).date()
-    if fecha_str == "hoy":
-        return hoy.strftime("%Y-%m-%d")
-    elif fecha_str == "ayer":
-        ayer = hoy - timedelta(days=1)
-        return ayer.strftime("%Y-%m-%d")
+metodos_pago = ["efectivo", "debito", "débito", "transferencia", "credito", "crédito"]
+
+def parse_frase_natural(texto):
+    texto = texto.lower()
+    hoy = datetime.now(ZONE).strftime("%Y-%m-%d")
+    ayer = (datetime.now(ZONE) - timedelta(days=1)).strftime("%Y-%m-%d")
+    
+    if "gast" in texto:
+        tipo = "Gasto"
+    elif "ingres" in texto or "pagaron" in texto or "cobré" in texto:
+        tipo = "Ingreso"
     else:
-        try:
-            # Intentar parsear formato YYYY-MM-DD
-            return datetime.strptime(fecha_str, "%Y-%m-%d").strftime("%Y-%m-%d")
-        except:
-            return None
+        return None
+
+    monto_match = re.search(r"(\d{1,3}(?:[.,]?\d{3})*(?:[.,]?\d{2})?)", texto)
+    if not monto_match:
+        return None
+    monto = monto_match.group(1).replace(".", "").replace(",", "")
+
+    metodo = next((m for m in metodos_pago if m in texto), "No especificado")
+
+    if "ayer" in texto:
+        fecha = ayer
+    else:
+        fecha = hoy
+
+    categoria_match = re.search(r"en\s+([\w\s]+?)(?:\s+con|\s*$)", texto)
+    categoria = categoria_match.group(1).strip().capitalize() if categoria_match else "General"
+    descripcion = f"{categoria}"
+
+    return {
+        "Fecha": fecha,
+        "Tipo": tipo,
+        "Monto": monto,
+        "Categoría": categoria,
+        "Método": metodo.capitalize(),
+        "Descripción": descripcion
+    }
+
+def respuesta_humana(tipo, categoria):
+    if tipo == "Gasto":
+        opciones = [
+            f"💸 Gasto anotado en {categoria}. ¡A cuidar esa billetera!",
+            f"✅ Listo, registré tu gasto en {categoria}.",
+            f"📉 Otro gasto en {categoria}. ¡Vamos controlando!",
+        ]
+    else:
+        opciones = [
+            f"🤑 ¡Ingreso en {categoria} anotado! Qué rico cobrar.",
+            f"✅ Registro guardado. ¡Vamos sumando ingresos!",
+            f"💰 Ingreso recibido y anotado como {categoria}.",
+        ]
+    return random.choice(opciones)
 
 @app.route("/whatsapp", methods=["POST"])
 def whatsapp():
@@ -38,72 +77,62 @@ def whatsapp():
     resp = MessagingResponse()
     msg = resp.message()
 
-    if incoming_msg.lower() == "/resumen":
-        try:
-            return enviar_resumen(msg)
-        except Exception as e:
-            msg.body("❌ Error al generar resumen.")
-            return str(resp)
-
+    # Intentar primero formato separado por comas
     datos = [x.strip() for x in incoming_msg.split(',')]
 
-    if len(datos) == 5:
-        tipo, monto, categoria, metodo, descripcion = datos
-        fecha = datetime.now(ZONE).strftime("%Y-%m-%d")
-    elif len(datos) == 6:
-        tipo, monto, categoria, metodo, descripcion, fecha_str = datos
-        fecha = parse_fecha(fecha_str)
-        if not fecha:
-            msg.body("❌ Fecha inválida. Usa AAAA-MM-DD o 'hoy'/'ayer'.")
+    if len(datos) == 5 or len(datos) == 6:
+        if len(datos) == 5:
+            tipo, monto, categoria, metodo, descripcion = datos
+            fecha = datetime.now(ZONE).strftime("%Y-%m-%d")
+        else:
+            tipo, monto, categoria, metodo, descripcion, fecha_str = datos
+            try:
+                if fecha_str.lower() == "hoy":
+                    fecha = datetime.now(ZONE).strftime("%Y-%m-%d")
+                elif fecha_str.lower() == "ayer":
+                    fecha = (datetime.now(ZONE) - timedelta(days=1)).strftime("%Y-%m-%d")
+                else:
+                    fecha = datetime.strptime(fecha_str, "%Y-%m-%d").strftime("%Y-%m-%d")
+            except:
+                msg.body("❌ Fecha inválida. Usa AAAA-MM-DD o 'hoy'/'ayer'.")
+                return str(resp)
+
+        try:
+            monto_num = float(monto)
+        except:
+            msg.body("❌ Monto inválido, debe ser un número.")
             return str(resp)
-    else:
-        msg.body("⚠️ Formato incorrecto. Usa:\nTipo, Monto, Categoría, Método, Descripción [, Fecha (opcional)]\nO envía /resumen para ver totales.")
+
+        fila = [fecha, tipo, monto_num, categoria, metodo, descripcion, from_number]
+        try:
+            sheet.append_row(fila)
+            msg.body(respuesta_humana(tipo, categoria))
+        except:
+            msg.body("❌ Error al guardar el registro.")
         return str(resp)
 
-    # Validar monto numérico
-    try:
-        monto_num = float(monto)
-    except:
-        msg.body("❌ Monto inválido, debe ser un número.")
+    # Si no es formato con comas, intentar parser de frase natural
+    resultado = parse_frase_natural(incoming_msg)
+    if resultado:
+        try:
+            fila = [
+                resultado["Fecha"],
+                resultado["Tipo"],
+                float(resultado["Monto"]),
+                resultado["Categoría"],
+                resultado["Método"],
+                resultado["Descripción"],
+                from_number
+            ]
+            sheet.append_row(fila)
+            msg.body(respuesta_humana(resultado["Tipo"], resultado["Categoría"]))
+        except:
+            msg.body("❌ Hubo un problema al guardar tu registro.")
         return str(resp)
 
-    # Guardar fila
-    fila = [fecha, tipo, monto_num, categoria, metodo, descripcion, from_number]
-    try:
-        sheet.append_row(fila)
-        msg.body(f"✅ Registro guardado:\n{fecha} - {tipo} {monto_num} {categoria}")
-    except Exception as e:
-        msg.body("❌ Error al guardar el registro.")
-
+    # Si no entendió ni como comando ni como frase
+    msg.body("⚠️ No entendí tu mensaje. Puedes decir algo como:\n- Gasté 2500 en comida\n- Hoy me pagaron 50000\n- O usa: Gasto, 2500, Comida, Efectivo, Almuerzo")
     return str(resp)
-
-def enviar_resumen(msg):
-    hoy = datetime.now(ZONE)
-    mes_actual = hoy.strftime("%Y-%m")
-    # Obtener todos los datos (asumiendo encabezado en fila 1)
-    registros = sheet.get_all_records()
-    total_gastos = 0.0
-    total_ingresos = 0.0
-
-    for r in registros:
-        fecha = r.get("Fecha", "")
-        tipo = r.get("Tipo", "").lower()
-        monto = float(r.get("Monto", 0))
-        if fecha.startswith(mes_actual):
-            if tipo == "gasto":
-                total_gastos += monto
-            elif tipo == "ingreso":
-                total_ingresos += monto
-
-    saldo = total_ingresos - total_gastos
-    resumen = (
-        f"📊 Resumen {mes_actual}\n"
-        f"Ingresos: {total_ingresos:.2f}\n"
-        f"Gastos: {total_gastos:.2f}\n"
-        f"Saldo: {saldo:.2f}"
-    )
-    msg.body(resumen)
-    return str(msg)
 
 if __name__ == "__main__":
     app.run()
