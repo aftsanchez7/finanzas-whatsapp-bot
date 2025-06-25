@@ -19,7 +19,6 @@ sheet = client.open("Finanzas WhatsApp Bot").worksheet("Datos")
 
 metodos_pago = ["efectivo", "debito", "débito", "transferencia", "credito", "crédito"]
 
-# Íconos por categoría
 categoria_iconos = {
     "Comida": "🍽️",
     "Transporte": "🚌",
@@ -139,9 +138,17 @@ def generar_resumen_mes():
 
     resumen = defaultdict(float)
     for row in registros:
-        if inicio_mes <= row["Fecha"] <= fin_mes:
-            key = f'{row["Tipo"]} - {row["Categoría"]}'
-            resumen[key] += float(row["Monto"])
+        fecha = row.get("Fecha", "")
+        tipo = row.get("Tipo", "")
+        categoria = row.get("Categoría", "General")
+        monto = row.get("Monto", 0)
+
+        if inicio_mes <= fecha <= fin_mes:
+            key = f"{tipo} - {categoria}"
+            try:
+                resumen[key] += float(monto)
+            except ValueError:
+                continue
 
     if not resumen:
         return "📉 Aún no hay movimientos registrados este mes."
@@ -173,12 +180,20 @@ def whatsapp():
         registros = sheet.get_all_records()
         total = 0
         for row in registros:
+            fecha = row.get("Fecha", "")
+            tipo = row.get("Tipo", "")
+            categoria = row.get("Categoría", "").lower()
+
             if (
-                row["Tipo"] == consulta["Tipo"]
-                and consulta["FechaInicio"] <= row["Fecha"] <= consulta["FechaFin"]
-                and (consulta["Categoría"] is None or row["Categoría"].lower() == consulta["Categoría"].lower())
+                tipo == consulta["Tipo"]
+                and consulta["FechaInicio"] <= fecha <= consulta["FechaFin"]
+                and (consulta["Categoría"] is None or categoria == consulta["Categoría"].lower())
             ):
-                total += float(row["Monto"])
+                try:
+                    total += float(row.get("Monto", 0))
+                except ValueError:
+                    continue
+
         msg.body(f"📊 Total de {consulta['Tipo'].lower()}s"
                  f"{' en ' + consulta['Categoría'] if consulta['Categoría'] else ''}"
                  f" entre {consulta['FechaInicio']} y {consulta['FechaFin']}: ${int(total):,}".replace(",", "."))
