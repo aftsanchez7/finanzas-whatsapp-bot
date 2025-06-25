@@ -19,7 +19,7 @@ sheet = client.open("Finanzas WhatsApp Bot").worksheet("Datos")
 
 metodos_pago = ["efectivo", "debito", "débito", "transferencia", "credito", "crédito"]
 
-# Íconos sugeridos por categoría
+# Íconos por categoría
 categoria_iconos = {
     "Comida": "🍽️",
     "Transporte": "🚌",
@@ -79,9 +79,10 @@ def parse_frase_natural(texto):
 
 def detectar_consulta(texto):
     texto = texto.lower()
-    if re.search(r"\b(gast|gasto|he gastado|gastos)\b", texto):
+
+    if re.search(r"\b(gast(e|é|ado)?|gastos?)\b", texto):
         tipo = "Gasto"
-    elif re.search(r"\b(ingres|ingreso|he ingresado|cobré|me pagaron|pagaron)\b", texto):
+    elif re.search(r"\b(ingres(o|é|ado)?|cobré|me pagaron|pagaron)\b", texto):
         tipo = "Ingreso"
     else:
         return None
@@ -160,12 +161,14 @@ def whatsapp():
     resp = MessagingResponse()
     msg = resp.message()
 
-    if incoming_msg.lower() in ["resumen", "resumen del mes", "mostrar resumen"]:
+    limpio = incoming_msg.lower().strip("¿?.,! ")
+
+    if any(p in limpio for p in ["resumen del mes", "mostrar resumen", "resumen"]):
         resumen = generar_resumen_mes()
         msg.body(resumen)
         return str(resp)
 
-    consulta = detectar_consulta(incoming_msg)
+    consulta = detectar_consulta(limpio)
     if consulta:
         registros = sheet.get_all_records()
         total = 0
@@ -193,7 +196,7 @@ def whatsapp():
         msg.body(respuesta_humana(tipo, categoria))
         return str(resp)
 
-    resultado = parse_frase_natural(incoming_msg)
+    resultado = parse_frase_natural(limpio)
     if resultado:
         fila = [
             resultado["Fecha"],
