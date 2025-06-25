@@ -175,6 +175,23 @@ def whatsapp():
         msg.body(resumen)
         return str(resp)
 
+    # ✅ Primero intenta registrar un gasto
+    resultado = parse_frase_natural(limpio)
+    if resultado:
+        fila = [
+            resultado["Fecha"],
+            resultado["Tipo"],
+            float(resultado["Monto"]),
+            resultado["Categoría"],
+            resultado["Método"],
+            resultado["Descripción"],
+            from_number
+        ]
+        sheet.append_row(fila)
+        msg.body(respuesta_humana(resultado["Tipo"], resultado["Categoría"]))
+        return str(resp)
+
+    # Luego, si no fue registro, detecta si es consulta
     consulta = detectar_consulta(limpio)
     if consulta:
         registros = sheet.get_all_records()
@@ -199,6 +216,7 @@ def whatsapp():
                  f" entre {consulta['FechaInicio']} y {consulta['FechaFin']}: ${int(total):,}".replace(",", "."))
         return str(resp)
 
+    # Modo manual tipo CSV
     datos = [x.strip() for x in incoming_msg.split(',')]
     if len(datos) in [5, 6]:
         if len(datos) == 5:
@@ -211,21 +229,7 @@ def whatsapp():
         msg.body(respuesta_humana(tipo, categoria))
         return str(resp)
 
-    resultado = parse_frase_natural(limpio)
-    if resultado:
-        fila = [
-            resultado["Fecha"],
-            resultado["Tipo"],
-            float(resultado["Monto"]),
-            resultado["Categoría"],
-            resultado["Método"],
-            resultado["Descripción"],
-            from_number
-        ]
-        sheet.append_row(fila)
-        msg.body(respuesta_humana(resultado["Tipo"], resultado["Categoría"]))
-        return str(resp)
-
+    # Si no se entendió
     msg.body("🤖 No entendí tu mensaje. Puedes decir:\n"
              "- *Gasté 2500 en comida con débito*\n"
              "- *Hoy me pagaron 50000*\n"
