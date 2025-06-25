@@ -18,11 +18,19 @@ sheet = client.open("Finanzas WhatsApp Bot").worksheet("Datos")
 
 metodos_pago = ["efectivo", "debito", "débito", "transferencia", "credito", "crédito"]
 
-def parse_frase_natural(texto):
+# --- Función para normalizar montos tipo "2 mil", "10k", "lucas"
+def normalizar_monto(texto):
     texto = texto.lower()
+    texto = re.sub(r'(\d+(?:[.,]?\d+)?)[ ]?(mil|lucas)', lambda m: str(int(float(m.group(1)) * 1000)), texto)
+    texto = re.sub(r'(\d+(?:[.,]?\d+)?)k', lambda m: str(int(float(m.group(1)) * 1000)), texto)
+    return texto
+
+# --- Parser natural
+def parse_frase_natural(texto):
+    texto = normalizar_monto(texto.lower())
     hoy = datetime.now(ZONE).strftime("%Y-%m-%d")
     ayer = (datetime.now(ZONE) - timedelta(days=1)).strftime("%Y-%m-%d")
-    
+
     if "gast" in texto:
         tipo = "Gasto"
     elif "ingres" in texto or "pagaron" in texto or "cobré" in texto:
@@ -30,10 +38,10 @@ def parse_frase_natural(texto):
     else:
         return None
 
-    monto_match = re.search(r"(\d{1,3}(?:[.,]?\d{3})*(?:[.,]?\d{2})?)", texto)
+    monto_match = re.search(r"(\d{3,})", texto)
     if not monto_match:
         return None
-    monto = monto_match.group(1).replace(".", "").replace(",", "")
+    monto = monto_match.group(1)
 
     metodo = next((m for m in metodos_pago if m in texto), "No especificado")
 
@@ -44,7 +52,7 @@ def parse_frase_natural(texto):
 
     categoria_match = re.search(r"en\s+([\w\s]+?)(?:\s+con|\s*$)", texto)
     categoria = categoria_match.group(1).strip().capitalize() if categoria_match else "General"
-    descripcion = f"{categoria}"
+    descripcion = categoria
 
     return {
         "Fecha": fecha,
@@ -55,6 +63,45 @@ def parse_frase_natural(texto):
         "Descripción": descripcion
     }
 
+# --- Consultas por lenguaje natural
+def detectar_consulta(texto):
+    texto = texto.lower()
+    tipo = None
+    categoria = None
+    fecha_inicio = None
+    fecha_fin = datetime.now(ZONE).date()
+
+    if "gasté" in texto or "gasto" in texto:
+        tipo = "Gasto"
+    elif "ingres" in texto or "cobré" in texto or "pagaron" in texto:
+        tipo = "Ingreso"
+    else:
+        return None
+
+    if "esta semana" in texto:
+        fecha_inicio = fecha_fin - timedelta(days=fecha_fin.weekday())
+    elif "este mes" in texto:
+        fecha_inicio = fecha_fin.replace(day=1)
+    elif "ayer" in texto:
+        fecha_inicio = fecha_fin - timedelta(days=1)
+        fecha_fin = fecha_inicio
+    else:
+        fecha_inicio = fecha_fin
+
+    categoria_match = re.search(r"en (\w+)", texto)
+    if categoria_match:
+        categoria = categoria_match.group(1).capitalize()
+    else:
+        categoria = None
+
+    return {
+        "Tipo": tipo,
+        "FechaInicio": fecha_inicio.strftime("%Y-%m-%d"),
+        "FechaFin": fecha_fin.strftime("%Y-%m-%d"),
+        "Categoría": categoria
+    }
+
+# --- Respuestas más humanas
 def respuesta_humana(tipo, categoria):
     if tipo == "Gasto":
         opciones = [
@@ -77,61 +124,53 @@ def whatsapp():
     resp = MessagingResponse()
     msg = resp.message()
 
-    # Intentar primero formato separado por comas
-    datos = [x.strip() for x in incoming_msg.split(',')]
+    # Intentar detectar una consulta
+    consulta = detectar_consulta(incoming_msg)
+    if consulta:
+        registros = sheet.get_all_records()
+        total = 0
+        for row in registros:
+            if (
+                row["Tipo"] == consulta["Tipo"]
+                and consulta["FechaInicio"] <= row["Fecha"] <= consulta["FechaFin"]
+                and (consulta["Categoría"] is None or row["Categoría"].lower() == consulta["Categoría"].lower())
+            ):
+                total += float(row["Monto"])
+        msg.body(f"📊 Total de {consulta['Tipo'].lower()}s"
+                 f"{' en ' + consulta['Categoría'] if consulta['Categoría'] else ''}"
+                 f" entre {consulta['FechaInicio']} y {consulta['FechaFin']}: ${int(total):,}".replace(",", "."))
+        return str(resp)
 
-    if len(datos) == 5 or len(datos) == 6:
+    # Intentar como mensaje con comas
+    datos = [x.strip() for x in incoming_msg.split(',')]
+    if len(datos) in [5, 6]:
         if len(datos) == 5:
             tipo, monto, categoria, metodo, descripcion = datos
             fecha = datetime.now(ZONE).strftime("%Y-%m-%d")
         else:
-            tipo, monto, categoria, metodo, descripcion, fecha_str = datos
-            try:
-                if fecha_str.lower() == "hoy":
-                    fecha = datetime.now(ZONE).strftime("%Y-%m-%d")
-                elif fecha_str.lower() == "ayer":
-                    fecha = (datetime.now(ZONE) - timedelta(days=1)).strftime("%Y-%m-%d")
-                else:
-                    fecha = datetime.strptime(fecha_str, "%Y-%m-%d").strftime("%Y-%m-%d")
-            except:
-                msg.body("❌ Fecha inválida. Usa AAAA-MM-DD o 'hoy'/'ayer'.")
-                return str(resp)
-
-        try:
-            monto_num = float(monto)
-        except:
-            msg.body("❌ Monto inválido, debe ser un número.")
-            return str(resp)
-
-        fila = [fecha, tipo, monto_num, categoria, metodo, descripcion, from_number]
-        try:
-            sheet.append_row(fila)
-            msg.body(respuesta_humana(tipo, categoria))
-        except:
-            msg.body("❌ Error al guardar el registro.")
+            tipo, monto, categoria, metodo, descripcion, fecha = datos
+        fila = [fecha, tipo, float(monto), categoria, metodo, descripcion, from_number]
+        sheet.append_row(fila)
+        msg.body(respuesta_humana(tipo, categoria))
         return str(resp)
 
-    # Si no es formato con comas, intentar parser de frase natural
+    # Parser natural como última opción
     resultado = parse_frase_natural(incoming_msg)
     if resultado:
-        try:
-            fila = [
-                resultado["Fecha"],
-                resultado["Tipo"],
-                float(resultado["Monto"]),
-                resultado["Categoría"],
-                resultado["Método"],
-                resultado["Descripción"],
-                from_number
-            ]
-            sheet.append_row(fila)
-            msg.body(respuesta_humana(resultado["Tipo"], resultado["Categoría"]))
-        except:
-            msg.body("❌ Hubo un problema al guardar tu registro.")
+        fila = [
+            resultado["Fecha"],
+            resultado["Tipo"],
+            float(resultado["Monto"]),
+            resultado["Categoría"],
+            resultado["Método"],
+            resultado["Descripción"],
+            from_number
+        ]
+        sheet.append_row(fila)
+        msg.body(respuesta_humana(resultado["Tipo"], resultado["Categoría"]))
         return str(resp)
 
-    # Si no entendió ni como comando ni como frase
-    msg.body("⚠️ No entendí tu mensaje. Puedes decir algo como:\n- Gasté 2500 en comida\n- Hoy me pagaron 50000\n- O usa: Gasto, 2500, Comida, Efectivo, Almuerzo")
+    msg.body("⚠️ No entendí tu mensaje. Puedes decir:\n- Gasté 2500 en pan\n- Hoy me pagaron 50000\n- ¿Cuánto gasté esta semana en comida?")
     return str(resp)
 
 if __name__ == "__main__":
