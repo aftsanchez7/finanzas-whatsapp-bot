@@ -7,6 +7,7 @@ from pytz import timezone
 import re
 import random
 from collections import defaultdict
+from word2number import w2n
 
 app = Flask(__name__)
 ZONE = timezone("America/Santiago")
@@ -35,8 +36,25 @@ categoria_iconos = {
 
 def normalizar_monto(texto):
     texto = texto.lower()
+
+    # Convertir expresiones tipo "3 mil", "4k"
     texto = re.sub(r'(\d+(?:[.,]?\d+)?)[ ]?(mil|lucas)', lambda m: str(int(float(m.group(1)) * 1000)), texto)
     texto = re.sub(r'(\d+(?:[.,]?\d+)?)k', lambda m: str(int(float(m.group(1)) * 1000)), texto)
+
+    # Convertir palabras numéricas como "dos mil" -> "2000"
+    try:
+        palabras = texto.split()
+        for i in range(len(palabras)):
+            subfrase = " ".join(palabras[i:i+4])
+            try:
+                valor = w2n.word_to_num(subfrase)
+                texto = texto.replace(subfrase, str(valor))
+                break
+            except:
+                continue
+    except:
+        pass
+
     return texto
 
 def parse_frase_natural(texto):
@@ -58,10 +76,7 @@ def parse_frase_natural(texto):
 
     metodo = next((m for m in metodos_pago if m in texto), "No especificado")
 
-    if "ayer" in texto:
-        fecha = ayer
-    else:
-        fecha = hoy
+    fecha = ayer if "ayer" in texto else hoy
 
     categoria_match = re.search(r"en\s+([\w\s]+?)(?:\s+con|\s*$)", texto)
     categoria = categoria_match.group(1).strip().capitalize() if categoria_match else "General"
@@ -175,7 +190,7 @@ def whatsapp():
         msg.body(resumen)
         return str(resp)
 
-    # ✅ Primero intenta registrar un gasto
+    # Primero intentamos registrar gasto o ingreso
     resultado = parse_frase_natural(limpio)
     if resultado:
         fila = [
@@ -191,7 +206,7 @@ def whatsapp():
         msg.body(respuesta_humana(resultado["Tipo"], resultado["Categoría"]))
         return str(resp)
 
-    # Luego, si no fue registro, detecta si es consulta
+    # Luego, consulta
     consulta = detectar_consulta(limpio)
     if consulta:
         registros = sheet.get_all_records()
@@ -216,7 +231,7 @@ def whatsapp():
                  f" entre {consulta['FechaInicio']} y {consulta['FechaFin']}: ${int(total):,}".replace(",", "."))
         return str(resp)
 
-    # Modo manual tipo CSV
+    # Formato manual CSV
     datos = [x.strip() for x in incoming_msg.split(',')]
     if len(datos) in [5, 6]:
         if len(datos) == 5:
@@ -229,7 +244,6 @@ def whatsapp():
         msg.body(respuesta_humana(tipo, categoria))
         return str(resp)
 
-    # Si no se entendió
     msg.body("🤖 No entendí tu mensaje. Puedes decir:\n"
              "- *Gasté 2500 en comida con débito*\n"
              "- *Hoy me pagaron 50000*\n"
