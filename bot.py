@@ -1,7 +1,7 @@
 from flask import Flask, request
 from twilio.twiml.messaging_response import MessagingResponse
 import gspread
-from oauth2client.service_account import ServiceAccountCredentials
+from google.oauth2.service_account import Credentials
 from datetime import datetime, timedelta
 from pytz import timezone
 import re
@@ -13,9 +13,12 @@ app = Flask(__name__)
 ZONE = timezone("America/Santiago")
 
 # Google Sheets
-scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-creds = ServiceAccountCredentials.from_json_keyfile_name("credenciales.json", scope)
-client = gspread.authorize(creds)
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive"
+]
+credentials = Credentials.from_service_account_file("credenciales.json", scopes=SCOPES)
+client = gspread.authorize(credentials)
 sheet = client.open("Finanzas WhatsApp Bot").worksheet("Datos")
 
 metodos_pago = ["efectivo", "debito", "débito", "transferencia", "credito", "crédito"]
