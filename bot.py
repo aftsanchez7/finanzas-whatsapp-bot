@@ -1,7 +1,7 @@
 from flask import Flask, request
 from twilio.twiml.messaging_response import MessagingResponse
 import gspread
-from google.oauth2.service_account import Credentials
+from oauth2client.service_account import ServiceAccountCredentials
 from datetime import datetime, timedelta
 from pytz import timezone
 import re
@@ -13,12 +13,9 @@ app = Flask(__name__)
 ZONE = timezone("America/Santiago")
 
 # Google Sheets
-SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive"
-]
-credentials = Credentials.from_service_account_file("credenciales.json", scopes=SCOPES)
-client = gspread.authorize(credentials)
+scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+creds = ServiceAccountCredentials.from_json_keyfile_name("credenciales.json", scope)
+client = gspread.authorize(creds)
 sheet = client.open("Finanzas WhatsApp Bot").worksheet("Datos")
 
 metodos_pago = ["efectivo", "debito", "débito", "transferencia", "credito", "crédito"]
@@ -181,6 +178,14 @@ def generar_resumen_mes():
 
 @app.route("/whatsapp", methods=["POST"])
 def whatsapp():
+    # Reordered logic: first try to register, then check for queries, then fallback
+    if 'gasté' in body or 'me pagaron' in body or 'ingreso' in body:
+        response_message = procesar_registro(body, fecha_actual, from_number)
+    elif 'cuánto' in body or 'resumen' in body or 'gastado' in body:
+        response_message = procesar_consulta(body, from_number)
+    else:
+        response_message = mensaje_ayuda()
+    return responder(response_message)
     incoming_msg = request.values.get('Body', '').strip()
     from_number = request.values.get('From', '')
     resp = MessagingResponse()
