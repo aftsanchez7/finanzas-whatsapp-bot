@@ -1,263 +1,141 @@
+import os
 from flask import Flask, request
 from twilio.twiml.messaging_response import MessagingResponse
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from datetime import datetime, timedelta
-from pytz import timezone
+import pytz
 import re
 import random
-from collections import defaultdict
 from word2number import w2n
 
-app = Flask(__name__)
-ZONE = timezone("America/Santiago")
+# Configurar zona horaria
+CL_TZ = timezone("America/Santiago")
 
-# Google Sheets
+app = Flask(__name__)
+
+# Autenticación con Google Sheets
 scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
 creds = ServiceAccountCredentials.from_json_keyfile_name("credenciales.json", scope)
 client = gspread.authorize(creds)
 sheet = client.open("Finanzas WhatsApp Bot").worksheet("Datos")
 
-metodos_pago = ["efectivo", "debito", "débito", "transferencia", "credito", "crédito"]
+# Respuestas más naturales
+respuestas_registro = [
+    "✅ Listo, anoté tu gasto en {categoria}. ¡Buen control! 💸",
+    "📝 Registrado en {categoria}. ¡Sigue así!",
+    "👌 Gasto en {categoria} guardado. ¡Vamos bien!",
+    "✅ Anotado: {categoria}. ¡Gracias por avisar!"
+]
 
-categoria_iconos = {
-    "Comida": "🍽️",
-    "Transporte": "🚌",
-    "Uber": "🚗",
-    "Sueldo": "💼",
-    "Almuerzo": "🥪",
-    "Delivery": "📦",
-    "Educación": "🎓",
-    "Salud": "💊",
-    "General": "🧾",
-    "Efectivo": "💵",
-    "Transferencia": "💳"
-}
+respuestas_error = [
+    "😕 No entendí bien. Intenta algo como: 'Gasté 2000 en comida'",
+    "📌 Puedes decir cosas como: 'Me pagaron 50000' o 'Gasté 3 mil en transporte'",
+    "🤔 No logré procesarlo. ¿Puedes intentarlo con otra frase?"
+]
 
-def normalizar_monto(texto):
-    texto = texto.lower()
+def obtener_fecha(msg):
+    if "ayer" in msg:
+        return (datetime.now(CL_TZ) - timedelta(days=1)).strftime("%Y-%m-%d")
+    else:
+        return datetime.now(CL_TZ).strftime("%Y-%m-%d")
 
-    # Convertir expresiones tipo "3 mil", "4k"
-    texto = re.sub(r'(\d+(?:[.,]?\d+)?)[ ]?(mil|lucas)', lambda m: str(int(float(m.group(1)) * 1000)), texto)
-    texto = re.sub(r'(\d+(?:[.,]?\d+)?)k', lambda m: str(int(float(m.group(1)) * 1000)), texto)
-
-    # Convertir palabras numéricas como "dos mil" -> "2000"
+def parsear_monto(texto):
     try:
-        palabras = texto.split()
-        for i in range(len(palabras)):
-            subfrase = " ".join(palabras[i:i+4])
+        # Intenta extraer un número como texto (e.g. "dos mil")
+        monto_textual = re.findall(r"(?:\b[a-z]+\b[\s]*){1,4}", texto.lower())
+        for fragmento in monto_textual:
             try:
-                valor = w2n.word_to_num(subfrase)
-                texto = texto.replace(subfrase, str(valor))
-                break
+                monto = w2n.word_to_num(fragmento.strip())
+                return monto
             except:
                 continue
+        # Si falla, intenta con números normales
+        numeros = re.findall(r"\d{1,3}(?:[.,]?\d{3})*", texto)
+        if numeros:
+            return int(numeros[0].replace(".", "").replace(",", ""))
     except:
-        pass
-
-    return texto
-
-def parse_frase_natural(texto):
-    texto = normalizar_monto(texto.lower())
-    hoy = datetime.now(ZONE).strftime("%Y-%m-%d")
-    ayer = (datetime.now(ZONE) - timedelta(days=1)).strftime("%Y-%m-%d")
-
-    if "gast" in texto:
-        tipo = "Gasto"
-    elif "ingres" in texto or "pagaron" in texto or "cobré" in texto:
-        tipo = "Ingreso"
-    else:
         return None
+    return None
 
-    monto_match = re.search(r"(\d{3,})", texto)
-    if not monto_match:
-        return None
-    monto = monto_match.group(1)
+def es_registro(mensaje):
+    return any(x in mensaje for x in ["gasté", "me pagaron", "ingresé", "recibí"])
 
-    metodo = next((m for m in metodos_pago if m in texto), "No especificado")
+def es_consulta(mensaje):
+    return any(x in mensaje for x in ["cuánto", "resumen", "total"])
 
-    fecha = ayer if "ayer" in texto else hoy
+def detectar_categoria(mensaje):
+    categorias = ["comida", "transporte", "salud", "ocio", "educación", "ropa", "hogar", "otros"]
+    for cat in categorias:
+        if cat in mensaje.lower():
+            return cat.capitalize()
+    return "Otros"
 
-    categoria_match = re.search(r"en\s+([\w\s]+?)(?:\s+con|\s*$)", texto)
-    categoria = categoria_match.group(1).strip().capitalize() if categoria_match else "General"
-    descripcion = categoria
+def detectar_tipo(mensaje):
+    if any(x in mensaje for x in ["me pagaron", "ingresé", "recibí"]):
+        return "Ingreso"
+    return "Gasto"
 
-    return {
-        "Fecha": fecha,
-        "Tipo": tipo,
-        "Monto": monto,
-        "Categoría": categoria,
-        "Método": metodo.capitalize(),
-        "Descripción": descripcion
-    }
-
-def detectar_consulta(texto):
-    texto = texto.lower()
-
-    if re.search(r"\b(gast(e|é|ado)?|gastos?)\b", texto):
-        tipo = "Gasto"
-    elif re.search(r"\b(ingres(o|é|ado)?|cobré|me pagaron|pagaron)\b", texto):
-        tipo = "Ingreso"
-    else:
-        return None
-
-    hoy = datetime.now(ZONE).date()
-    if "esta semana" in texto:
+def detectar_rango_fechas(mensaje):
+    hoy = datetime.now(CL_TZ).date()
+    if "semana" in mensaje:
         inicio = hoy - timedelta(days=hoy.weekday())
         fin = hoy
-    elif "este mes" in texto:
+    elif "mes" in mensaje:
         inicio = hoy.replace(day=1)
         fin = hoy
-    elif "ayer" in texto:
-        inicio = hoy - timedelta(days=1)
-        fin = inicio
-    elif "hoy" in texto:
-        inicio = hoy
-        fin = hoy
     else:
-        inicio = hoy
-        fin = hoy
+        inicio = fin = hoy
+    return inicio.strftime("%Y-%m-%d"), fin.strftime("%Y-%m-%d")
 
-    categoria_match = re.search(r"en (\w+)", texto)
-    categoria = categoria_match.group(1).capitalize() if categoria_match else None
+def procesar_registro(mensaje, numero):
+    monto = parsear_monto(mensaje)
+    if not monto:
+        return random.choice(respuestas_error)
 
-    return {
-        "Tipo": tipo,
-        "FechaInicio": inicio.strftime("%Y-%m-%d"),
-        "FechaFin": fin.strftime("%Y-%m-%d"),
-        "Categoría": categoria
-    }
+    tipo = detectar_tipo(mensaje)
+    categoria = detectar_categoria(mensaje)
+    fecha = obtener_fecha(mensaje)
 
-def respuesta_humana(tipo, categoria):
-    categoria = categoria.capitalize()
-    icono = categoria_iconos.get(categoria, "🧾")
-    if tipo == "Gasto":
-        opciones = [
-            f"{icono} ¡Anotado tu gasto en {categoria}! A seguir controlando 💸",
-            f"{icono} Registro guardado. Otro gasto más en {categoria} 😅",
-            f"{icono} Gasto en {categoria} añadido. ¡Vamos bien! ✅"
-        ]
+    fila = [fecha, tipo, monto, categoria, "", mensaje, numero]
+    sheet.append_row(fila)
+    return random.choice(respuestas_registro).format(categoria=categoria)
+
+def procesar_consulta(mensaje):
+    inicio, fin = detectar_rango_fechas(mensaje)
+    categoria = detectar_categoria(mensaje) if any(cat in mensaje for cat in ["comida", "transporte", "ocio", "salud"]) else None
+
+    datos = sheet.get_all_records()
+    total = 0
+    for fila in datos:
+        try:
+            if fila["Tipo"].lower() == "gasto" and inicio <= fila["Fecha"] <= fin:
+                if not categoria or fila["Categoría"].lower() == categoria.lower():
+                    total += int(fila["Monto"])
+        except:
+            continue
+
+    if categoria:
+        return f"📊 Total de gastos en {categoria} entre {inicio} y {fin}: ${total}"
     else:
-        opciones = [
-            f"{icono} Ingreso en {categoria} registrado. ¡Vamos creciendo! 💰",
-            f"{icono} ¡Qué bien! Anoté tu ingreso en {categoria} ✅",
-            f"{icono} Ingreso guardado. ¡Sigue así! 📈"
-        ]
-    return random.choice(opciones)
-
-def generar_resumen_mes():
-    hoy = datetime.now(ZONE).date()
-    inicio_mes = hoy.replace(day=1).strftime("%Y-%m-%d")
-    fin_mes = hoy.strftime("%Y-%m-%d")
-    registros = sheet.get_all_records()
-
-    resumen = defaultdict(float)
-    for row in registros:
-        fecha = row.get("Fecha", "")
-        tipo = row.get("Tipo", "")
-        categoria = row.get("Categoría", "General")
-        monto = row.get("Monto", 0)
-
-        if inicio_mes <= fecha <= fin_mes:
-            key = f"{tipo} - {categoria}"
-            try:
-                resumen[key] += float(monto)
-            except ValueError:
-                continue
-
-    if not resumen:
-        return "📉 Aún no hay movimientos registrados este mes."
-
-    mensaje = "📊 *Resumen del mes:*\n"
-    for k, v in resumen.items():
-        tipo, cat = k.split(" - ")
-        icono = categoria_iconos.get(cat, "🧾")
-        mensaje += f"{icono} {tipo} en {cat}: ${int(v):,}\n".replace(",", ".")
-
-    return mensaje.strip()
+        return f"📊 Total de gastos entre {inicio} y {fin}: ${total}"
 
 @app.route("/whatsapp", methods=["POST"])
 def whatsapp():
-    # Reordered logic: first try to register, then check for queries, then fallback
-    if 'gasté' in body or 'me pagaron' in body or 'ingreso' in body:
-        response_message = procesar_registro(body, fecha_actual, from_number)
-    elif 'cuánto' in body or 'resumen' in body or 'gastado' in body:
-        response_message = procesar_consulta(body, from_number)
+    mensaje = request.form.get("Body").lower()
+    numero = request.form.get("From")
+    respuesta = ""
+
+    if es_registro(mensaje):
+        respuesta = procesar_registro(mensaje, numero)
+    elif es_consulta(mensaje):
+        respuesta = procesar_consulta(mensaje)
     else:
-        response_message = mensaje_ayuda()
-    return responder(response_message)
-    incoming_msg = request.values.get('Body', '').strip()
-    from_number = request.values.get('From', '')
-    resp = MessagingResponse()
-    msg = resp.message()
+        respuesta = random.choice(respuestas_error)
 
-    limpio = incoming_msg.lower().strip("¿?.,! ")
-
-    if any(p in limpio for p in ["resumen del mes", "mostrar resumen", "resumen"]):
-        resumen = generar_resumen_mes()
-        msg.body(resumen)
-        return str(resp)
-
-    # Primero intentamos registrar gasto o ingreso
-    resultado = parse_frase_natural(limpio)
-    if resultado:
-        fila = [
-            resultado["Fecha"],
-            resultado["Tipo"],
-            float(resultado["Monto"]),
-            resultado["Categoría"],
-            resultado["Método"],
-            resultado["Descripción"],
-            from_number
-        ]
-        sheet.append_row(fila)
-        msg.body(respuesta_humana(resultado["Tipo"], resultado["Categoría"]))
-        return str(resp)
-
-    # Luego, consulta
-    consulta = detectar_consulta(limpio)
-    if consulta:
-        registros = sheet.get_all_records()
-        total = 0
-        for row in registros:
-            fecha = row.get("Fecha", "")
-            tipo = row.get("Tipo", "")
-            categoria = row.get("Categoría", "").lower()
-
-            if (
-                tipo == consulta["Tipo"]
-                and consulta["FechaInicio"] <= fecha <= consulta["FechaFin"]
-                and (consulta["Categoría"] is None or categoria == consulta["Categoría"].lower())
-            ):
-                try:
-                    total += float(row.get("Monto", 0))
-                except ValueError:
-                    continue
-
-        msg.body(f"📊 Total de {consulta['Tipo'].lower()}s"
-                 f"{' en ' + consulta['Categoría'] if consulta['Categoría'] else ''}"
-                 f" entre {consulta['FechaInicio']} y {consulta['FechaFin']}: ${int(total):,}".replace(",", "."))
-        return str(resp)
-
-    # Formato manual CSV
-    datos = [x.strip() for x in incoming_msg.split(',')]
-    if len(datos) in [5, 6]:
-        if len(datos) == 5:
-            tipo, monto, categoria, metodo, descripcion = datos
-            fecha = datetime.now(ZONE).strftime("%Y-%m-%d")
-        else:
-            tipo, monto, categoria, metodo, descripcion, fecha = datos
-        fila = [fecha, tipo, float(monto), categoria, metodo, descripcion, from_number]
-        sheet.append_row(fila)
-        msg.body(respuesta_humana(tipo, categoria))
-        return str(resp)
-
-    msg.body("🤖 No entendí tu mensaje. Puedes decir:\n"
-             "- *Gasté 2500 en comida con débito*\n"
-             "- *Hoy me pagaron 50000*\n"
-             "- *¿Cuánto gasté esta semana?*\n"
-             "- *Resumen del mes*")
-    return str(resp)
+    twiml = MessagingResponse()
+    twiml.message(respuesta)
+    return str(twiml)
 
 if __name__ == "__main__":
-    app.run()
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
